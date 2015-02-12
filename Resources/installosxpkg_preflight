@@ -1,0 +1,224 @@
+#!/usr/bin/python
+# encoding: utf-8
+#
+# Copyright 2015 Klaus Wik.
+# Copyright 2009-2014 Greg Neagle.
+#
+# Licensed under the Apache License, Version 2.0 (the 'License');
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an 'AS IS' BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+'''
+createOSXinstallPkg preflight script
+
+Created 11 Feb 2015 by Klaus Wik
+
+Sets up an OS X install.
+This is intended to be run as a package preflight script.'''
+
+from __future__ import print_function
+import sys
+import os
+from pprint import pprint
+
+# This part was shamelessly copied from Greg Neagle's FoundationPlist.py
+# https://code.google.com/p/munki/source/browse/code/client/munkilib/FoundationPlist.py
+
+
+from Foundation import NSData, \
+                       NSPropertyListSerialization, \
+                       NSPropertyListMutableContainers, \
+                       NSPropertyListXMLFormat_v1_0
+
+class FoundationPlistException(Exception):
+    pass
+
+class NSPropertyListSerializationException(FoundationPlistException):
+    pass
+
+class NSPropertyListWriteException(FoundationPlistException):
+    pass
+
+
+def readPlist(filepath):
+    """
+    Read a .plist file from filepath.  Return the unpacked root object
+    (which is usually a dictionary).
+
+    Shamelessly copied from Greg Neagle
+    """
+    plistData = NSData.dataWithContentsOfFile_(filepath)
+    dataObject, plistFormat, error = \
+        NSPropertyListSerialization.propertyListFromData_mutabilityOption_format_errorDescription_(
+                     plistData, NSPropertyListMutableContainers, None, None)
+    if error:
+        error = error.encode('ascii', 'ignore')
+        errmsg = "%s in file %s" % (error, filepath)
+        raise NSPropertyListSerializationException(errmsg)
+    else:
+        return dataObject
+
+# End of copied content
+
+
+def exitGracefully(errmess=''):
+    '''Exit gracefully with message'''
+
+    if errmess:
+        print("{0}\n".format(errmess), file=sys.stderr)
+
+    exit(1)
+
+
+def getLocalUser(filename, filter=lambda x: False):
+    '''Get essential data about a local user from filename
+       An example of the optional filter could be to exclude by uid
+    '''
+    data=readPlist(filename)
+    if filter(data):
+        return None
+    name=data.get('name')[0]
+    uid=int(data.get('uid')[0])
+    uuid=data.get('generateduid')[0]
+    return {'name':name, 'uid':uid, 'generateduid':uuid }
+    
+def getLocalGroup(filename, filter=lambda x: False):
+    '''Get essential data about a local group from filename
+       An example of the optional filter could be to exclude by name
+    '''
+    data=readPlist(filename)
+    if filter(data):
+        return None
+    name=data.get('name')[0]
+    gid=int(data.get('gid')[0])
+    uuid=data.get('generateduid')[0]
+    users=data.get('users')
+    members=data.get('groupmembers')
+    groups=data.get('nestedgroups')
+    return {'name'        :name,
+            'uid'         :gid,
+            'generateduid':uuid,
+            'users'       :users,
+            'groupmembers':members,
+            'nestedgroups':groups}
+    
+
+def getLocalUsers(volume='/'):
+    '''Returns a list of all the file names of all users for a given volume'''
+    ds_users_dir="{0}var/db/dslocal/nodes/Default/users".format(volume)
+    ds_users=[ u for u in [ getLocalUser("{0}/{1}".format(ds_users_dir, x), filter=lambda y: not y.get('uid')) for x in os.listdir(ds_users_dir) ] if u ]
+    return ds_users
+
+def getLocalGroups(volume='/'):
+    '''Returns a list of all the file names of all groups for a given volume'''
+    ds_groups_dir="{0}var/db/dslocal/nodes/Default/groups".format(volume)
+    ds_groups=[ g for g in [ getLocalGroup("{0}/{1}".format(ds_groups_dir, x)) for x in os.listdir(ds_groups_dir) ] if g ]
+
+    return ds_groups
+
+def getExpandedGroup(users, groups, groupname=None, groupuuid=None):
+    '''Get all group members from a named group based on the
+       users list and group list passed as arguments.
+       
+       Either a group name or a generated uid must be provided as a
+       named argument, but failure to do that is not fatal.'''
+
+    # Inefficient by coding standards, but sufficient for current use.
+    user_dict_by_name = {x.get('name'): x for x in users}
+    user_dict_by_uuid = {x.get('generateduid'): x for x in users}
+    group_dict_by_name = {x.get('name'): x for x in groups}
+    group_dict_by_uuid = {x.get('generateduid'): x for x in groups}
+
+    if not (groupname or groupuuid):
+        # Lets allow this for now:
+        # exitGracefully('getExpandedGroup was called with no group name nor generateduid')
+        return []
+    
+    users_names=[]
+    this_group=None
+    if groupname:
+        this_group=group_dict_by_name[groupname]
+    else:
+        this_group=group_dict_by_uuid[groupuuid]
+
+        
+    # All the users by name
+    for name in this_group['users']:
+            users_names.append(name)
+    # And the name of all the users_by_uuid
+    for name in [user_dict_by_uuid[uuid]['name'] for uuid in this_group['groupmembers']]:
+            users_names.append(name)
+        
+    # Then all the names of all nested members.
+    try:
+        for guuid in this_group['nestedgroups']:
+            if guuid in group_dict_by_uuid.keys():
+                user_names += getExpandedGroup(users, groups, groupuuid=guuid)
+        # else:
+        #    We assume that foreign groups (or deleted groups) can't contain local users.
+        #    print "Not a local group. Skipping {0}".format(guuid)
+    except TypeError, e:
+        if e.message.startswith('\'NoneType\''):
+            # Yes, that just makes this simpler. Now go complain about
+            # something more important.
+            pass
+        else:
+            raise
+
+    return sorted(set(users_names))
+
+
+
+
+def main():
+    '''Main preflight code
+    $0 - Script path
+    $1 - Package path
+    $2 - Target location
+    $3 - Target volume
+
+    Returns 0 for success !0 for failure'''
+
+    # get args passed to us from the Installer
+    try:
+        pkg_path = sys.argv[1]
+        target_volume_path = sys.argv[3]
+    except IndexError:
+        exitGracefully('We received no arguments from installer. Which is bad.')
+
+
+    ##
+    # Log all local users with admin rights to a file that the
+    # Yosemite update does not remove. These can then be recreated
+    # in a firstinstall script with updated information.
+
+    local_admins=getExpandedGroup(getLocalUsers(target_volume_path),
+                     getLocalGroups(target_volume_path),
+                     groupname='admin')
+
+    # We do not need to know about root.
+    local_admins.remove('root')
+
+    logfile='/etc/uio/localadmin-preinstall'
+    with open('{0}/{1}'.format(target_volume_path, logfile), 'w') as f:
+        for user in local_admins:
+            print(user, file=f)
+
+    # End of local users log
+    ##
+
+
+    exit(0)
+
+if __name__ == '__main__':
+    main()
+
+

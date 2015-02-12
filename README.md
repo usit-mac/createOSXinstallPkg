@@ -7,6 +7,7 @@
 This toolset, which includes:
 
     createOSXinstallPkg
+    Resources/installosxpkg_preflight
     Resources/installosxpkg_postflight
 
 You may put the toolset anywhere you'd like, but keep the Resources folder and its contents in the same directory as `createOSXinstallPkg`.
